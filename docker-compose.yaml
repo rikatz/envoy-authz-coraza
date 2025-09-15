@@ -1,0 +1,29 @@
+services:
+
+  front-envoy:
+    image: envoyproxy/envoy:dev-564612e32eafc10a7a7fd490cdb5cc7149e5802b
+    volumes:
+    - ./config/envoy.yaml:/envoy.yaml
+    ports:
+    - "8000:8000"
+    command:
+    - -c
+    - /envoy.yaml
+    depends_on:
+      waf-service:
+        condition: service_started
+      upstream-service:
+        condition: service_started
+
+  waf-service:
+    build:
+      dockerfile: Dockerfile
+    volumes:
+    - ./default.conf:/default.conf
+    command:
+    - /waf
+    - -directives=/default.conf
+
+  upstream-service:
+    image: gcr.io/k8s-staging-gateway-api/echo-basic:v20250910-v1.3.0-180-g58c1466f
+
