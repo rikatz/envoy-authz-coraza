@@ -1,9 +1,9 @@
 services:
 
   front-envoy:
-    image: envoyproxy/envoy:dev-564612e32eafc10a7a7fd490cdb5cc7149e5802b
+    image: envoyproxy/envoy:distroless-v1.36.4
     volumes:
-    - ./config/envoy.yaml:/envoy.yaml
+    - ./config/envoyextproc.yaml:/envoy.yaml
     ports:
     - "8000:8000"
     command:
@@ -25,5 +25,5 @@ services:
     - -directives=/default.conf
 
   upstream-service:
-    image: gcr.io/k8s-staging-gateway-api/echo-basic:v20250910-v1.3.0-180-g58c1466f
+    image: gcr.io/k8s-staging-gateway-api/echo-basic:v20251204-v1.4.1
 

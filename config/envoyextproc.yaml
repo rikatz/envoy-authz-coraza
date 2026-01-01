@@ -23,13 +23,22 @@ static_resources:
                 route:
                   cluster: upstream-service
           http_filters:
-          - name: envoy.filters.http.ext_authz
+          - name: envoy.filters.http.ext_proc
             typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+              "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor"
+              failure_mode_allow: false
+              send_body_without_waiting_for_header_response: true
+              processing_mode:
+                request_header_mode: SEND
+                response_header_mode: SEND
+                request_body_mode: STREAMED
+                response_body_mode: STREAMED
+                # Optimization: Ignore trailers since we don't use them
+                request_trailer_mode: SKIP
+                response_trailer_mode: SKIP
               grpc_service:
                 envoy_grpc:
-                  cluster_name: ext_authz-grpc-service
-                timeout: 0.250s
+                  cluster_name: ext-proc
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -48,7 +57,7 @@ static_resources:
                 address: upstream-service
                 port_value: 3000
 
-  - name: ext_authz-grpc-service
+  - name: ext-proc
     type: STRICT_DNS
     lb_policy: ROUND_ROBIN
     typed_extension_protocol_options:
@@ -57,7 +66,7 @@ static_resources:
         explicit_http_config:
           http2_protocol_options: {}
     load_assignment:
-      cluster_name: ext_authz-grpc-service
+      cluster_name: ext-proc
       endpoints:
       - lb_endpoints:
         - endpoint:
