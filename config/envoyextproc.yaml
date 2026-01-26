@@ -11,6 +11,7 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           codec_type: AUTO
           stat_prefix: ingress_http
+          #use_remote_address: true # We MUST pass the real client IP
           route_config:
             name: local_route
             virtual_hosts:
@@ -36,6 +37,11 @@ static_resources:
                 # Optimization: Ignore trailers since we don't use them
                 request_trailer_mode: SKIP
                 response_trailer_mode: SKIP
+              request_attributes:
+              - "source.address" # IP:Port
+              - "destination.address" # IP:Port
+              - "request.protocol" # "HTTP/1.1"
+              - "request.host" # Hostname
               grpc_service:
                 envoy_grpc:
                   cluster_name: ext-proc
