@@ -14,6 +14,9 @@ After the service is available, on a different terminal you can test the rules u
 $ curl --fail localhost:8000/service?id=0
 curl: (22) The requested URL returned error: 403
 
+$ curl --data "lalalala" --resolve xpto:8000:127.0.0.1 http://xpto:8000/service?id=1
+curl: (22) The requested URL returned error: 403
+
 $ curl --fail localhost:8000/service?id=1
 {
  "path": "/service?id=1",
@@ -23,7 +26,8 @@ $ curl --fail localhost:8000/service?id=1
 ```
 
 This happens because the current used [WAF Rules](./default.conf) filter requests that 
-contains the query arg `id`, blocking any request where `id=0`.
+contains the query arg `id`, blocking any request where `id=0` and also any request that
+contains the string "lalalala" in its body
 
 ## tl;dr architecture
 

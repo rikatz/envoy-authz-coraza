@@ -1,6 +1,7 @@
 package waf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +26,10 @@ type serverExtProc struct {
 }
 
 type requestTransaction struct {
-	id  string
-	tx  types.Transaction
-	req *extproc.ProcessingRequest_RequestHeaders
+	id          string
+	tx          types.Transaction
+	requestBody bytes.Buffer
+	//req *extproc.ProcessingRequest_RequestHeaders
 }
 
 var _ extproc.ExternalProcessorServer = &serverExtProc{}
@@ -48,6 +50,8 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 	// the request
 	var transactionID string
 	ts := time.Now().Format(time.RFC3339Nano)
+	var resp = &extproc.ProcessingResponse{}
+	var tx *requestTransaction
 
 	for {
 		req, err := stream.Recv()
@@ -64,17 +68,16 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 			return err
 		}
 
-		var resp = &extproc.ProcessingResponse{}
-
 		switch v := req.Request.(type) {
 		// First case / step is the request Headers. We can drop here already in case
 		// something matches an early rule for IP, port, etc
 		case *extproc.ProcessingRequest_RequestHeaders:
-			tx, err := s.newTransaction(v)
+			tx, err = s.newTransaction(v)
 			if err != nil {
 				return dropTransaction(stream, err)
 			}
-			transactionID = tx.id
+			transactionID = tx.tx.ID()
+			log.Printf("request transaction id: %s", transactionID)
 
 			defer func() {
 				tx.tx.ProcessLogging()
@@ -82,7 +85,7 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 					log.Printf("tx %s failed to close transaction %s", tx.tx.ID(), err)
 				}
 			}()
-			if err := tx.processRequestHeaders(req.GetAttributes()); err != nil {
+			if err := tx.processRequestHeaders(req.GetAttributes(), req.GetRequestHeaders().Headers); err != nil {
 				return dropTransaction(stream, err)
 			}
 			resp = &extproc.ProcessingResponse{
@@ -93,12 +96,16 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 
 		case *extproc.ProcessingRequest_RequestBody:
 			// Transaction ID MUST exist before moving to request body or any other part
-			if transactionID == "" {
+			log.Printf("response transaction id: %s", transactionID)
+
+			out := fmt.Sprintf("%s Request Body: %v\n", ts, v.RequestBody)
+			log.Print(out)
+			if transactionID == "" || tx == nil {
 				return dropUnknownTransaction(stream)
 			}
-			if b := req.GetRequestBody(); b != nil {
-				out := fmt.Sprintf("%s REQUEST_BODY (end_of_stream=%v, body_len=%d, body=%s)\n", ts, b.EndOfStream, len(b.GetBody()), string(b.Body))
-				log.Print(out)
+
+			if err := tx.processRequestBody(v.RequestBody); err != nil {
+				return dropTransaction(stream, err)
 			}
 			resp = &extproc.ProcessingResponse{
 				Response: &extproc.ProcessingResponse_RequestBody{
@@ -108,7 +115,7 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 
 		case *extproc.ProcessingRequest_ResponseHeaders:
 			// Transaction ID MUST exist before moving to request body or any other part
-			if transactionID == "" {
+			if transactionID == "" || tx == nil {
 				return dropUnknownTransaction(stream)
 			}
 			if rh := req.GetResponseHeaders(); rh != nil {
@@ -171,17 +178,16 @@ func (s *serverExtProc) newTransaction(req *extproc.ProcessingRequest_RequestHea
 
 	tx := s.waf.NewTransactionWithID(transactionID)
 	return &requestTransaction{
-		req: req,
-		tx:  tx,
-		id:  transactionID,
+		tx:          tx,
+		id:          transactionID,
+		requestBody: bytes.Buffer{},
 	}, nil
 }
 
 // processRequestHeaders is the initial step for the WAF. It receives the initial
 // request, extract the headers and the transaction ID, and returns a new
 // transaction, the transaction ID and an error if something happens on this state
-func (r *requestTransaction) processRequestHeaders(attrs map[string]*structpb.Struct) error {
-
+func (r *requestTransaction) processRequestHeaders(attrs map[string]*structpb.Struct, headers *corev3.HeaderMap) error {
 	srcAddrPortRaw := getAttribute(attrs, "source.address")
 	srcAddrPort, err := netip.ParseAddrPort(srcAddrPortRaw)
 	if err != nil {
@@ -196,24 +202,52 @@ func (r *requestTransaction) processRequestHeaders(attrs map[string]*structpb.St
 
 	r.tx.ProcessConnection(srcAddrPort.Addr().String(), int(srcAddrPort.Port()), dstAddrPort.Addr().String(), int(dstAddrPort.Port()))
 
-	method := getHeaderValue(r.req.RequestHeaders.Headers, ":method")
-	path := getHeaderValue(r.req.RequestHeaders.Headers, ":path")
+	method := getHeaderValue(headers, ":method")
+	path := getHeaderValue(headers, ":path")
 	httpVersion := getAttribute(attrs, "request.protocol")
 	r.tx.ProcessURI(path, method, httpVersion)
 
-	hostPort := getHeaderValue(r.req.RequestHeaders.Headers, ":authority")
+	hostPort := getHeaderValue(headers, ":authority")
 	host, _, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return fmt.Errorf("error extracting the host header: %w", err)
 	}
 
 	r.tx.SetServerName(host)
-	r.setHeaders()
+	r.setHeaders(headers)
 
 	if it := r.tx.ProcessRequestHeaders(); it != nil {
 		return fmt.Errorf("request denied by WAF rule %d", it.RuleID)
 	}
 
+	return nil
+}
+
+// processRequestBody will take the body of a request and check against Coraza rules.
+// It will return an error in case any issue is found
+func (r *requestTransaction) processRequestBody(body *extproc.HttpBody) error {
+	_, err := r.requestBody.Write(body.Body)
+	if err != nil {
+		return fmt.Errorf("error accumulating request body: %w", err)
+	}
+	// End Of Stream, we can process
+	if body.EndOfStream {
+		it, _, err := r.tx.WriteRequestBody(r.requestBody.Bytes())
+		if err != nil {
+			return fmt.Errorf("error parsing the request body: %w", err)
+		}
+		if it != nil {
+			return fmt.Errorf("request denied by WAF rule and action: %d - %s", it.RuleID, it.Action)
+		}
+
+		it, err = r.tx.ProcessRequestBody()
+		if err != nil {
+			return fmt.Errorf("error processing the request body: %w", err)
+		}
+		if it != nil {
+			return fmt.Errorf("request denied by WAF rule and action: %d - %s", it.RuleID, it.Action)
+		}
+	}
 	return nil
 }
 
@@ -234,8 +268,8 @@ func dropTransaction(stream extproc.ExternalProcessor_ProcessServer, err error) 
 	return nil
 }
 
-func (r *requestTransaction) setHeaders() {
-	for _, h := range r.req.RequestHeaders.Headers.Headers {
+func (r *requestTransaction) setHeaders(headers *corev3.HeaderMap) {
+	for _, h := range headers.Headers {
 		if !strings.HasPrefix(h.Key, ":") {
 			value := h.Value
 			if value == "" {
