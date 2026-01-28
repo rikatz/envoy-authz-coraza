@@ -33,7 +33,7 @@ static_resources:
                 request_header_mode: SEND
                 response_header_mode: SEND
                 request_body_mode: STREAMED
-                response_body_mode: STREAMED
+                response_body_mode: BUFFERED # We can change this to STREAMED, but there may be leaks as Envoy will send the response in chunks
                 # Optimization: Ignore trailers since we don't use them
                 request_trailer_mode: SKIP
                 response_trailer_mode: SKIP

@@ -17,17 +17,21 @@ curl: (22) The requested URL returned error: 403
 $ curl --data "lalalala" --resolve xpto:8000:127.0.0.1 http://xpto:8000/service?id=1
 curl: (22) The requested URL returned error: 403
 
-$ curl --fail localhost:8000/service?id=1
-{
- "path": "/service?id=1",
- "host": "localhost:8000",
- ...
-}
+$ curl -v -H "X-Echo-Set-Header: badheader: yeap" --resolve xpto:8000:127.0.0.1 http://xpto:8000/service?id=1
+...
+403 Forbidden: Blocked by WAF - request denied by WAF rule 900005
+
+$ curl -H "block: confidential_data" --resolve xpto:8000:127.0.0.1 http://xpto:8000/service
+* Request completely sent off
+< HTTP/1.1 500 Internal Server Error
 ```
 
 This happens because the current used [WAF Rules](./default.conf) filter requests that 
 contains the query arg `id`, blocking any request where `id=0` and also any request that
-contains the string "lalalala" in its body
+contains the string "lalalala" in its body.
+
+Additionally, there are two rules created to verify the response, blocking it in case
+there is a header called "badheader" on the response, or the body contains a value called `confidential_data`.
 
 ## tl;dr architecture
 

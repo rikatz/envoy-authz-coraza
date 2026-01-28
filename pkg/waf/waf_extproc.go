@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,9 +27,10 @@ type serverExtProc struct {
 }
 
 type requestTransaction struct {
-	id          string
-	tx          types.Transaction
-	requestBody bytes.Buffer
+	id           string
+	tx           types.Transaction
+	requestBody  bytes.Buffer
+	responseBody bytes.Buffer
 	//req *extproc.ProcessingRequest_RequestHeaders
 }
 
@@ -77,15 +79,19 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 				return dropTransaction(stream, err)
 			}
 			transactionID = tx.tx.ID()
-			log.Printf("request transaction id: %s", transactionID)
 
+			// First step can also add the transaction logging and transaction closing
 			defer func() {
 				tx.tx.ProcessLogging()
 				if err := tx.tx.Close(); err != nil {
 					log.Printf("tx %s failed to close transaction %s", tx.tx.ID(), err)
 				}
 			}()
-			if err := tx.processRequestHeaders(req.GetAttributes(), req.GetRequestHeaders().Headers); err != nil {
+			// TODO: RequestHeaders has a EndOfStream bool, is there a case where
+			// more than one RequestHeader calls will be made to fill other headers?
+			// TODO1 (for safety) - can RequestHeaders be null here? We must verify this pointer
+			// (all of the fields that can be nullable)
+			if err := tx.processRequestHeaders(req.GetAttributes(), v.RequestHeaders.Headers); err != nil {
 				return dropTransaction(stream, err)
 			}
 			resp = &extproc.ProcessingResponse{
@@ -95,11 +101,6 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 			}
 
 		case *extproc.ProcessingRequest_RequestBody:
-			// Transaction ID MUST exist before moving to request body or any other part
-			log.Printf("response transaction id: %s", transactionID)
-
-			out := fmt.Sprintf("%s Request Body: %v\n", ts, v.RequestBody)
-			log.Print(out)
 			if transactionID == "" || tx == nil {
 				return dropUnknownTransaction(stream)
 			}
@@ -118,10 +119,14 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 			if transactionID == "" || tx == nil {
 				return dropUnknownTransaction(stream)
 			}
-			if rh := req.GetResponseHeaders(); rh != nil {
-				out := fmt.Sprintf("%s RESPONSE_HEADERS: %v\n", ts, rh)
-				log.Print(out)
+
+			out := fmt.Sprintf("%s RESPONSE_HEADERS: %v\n", ts, v.ResponseHeaders)
+			log.Print(out)
+
+			if err := tx.processResponsetHeaders(req.GetAttributes(), v.ResponseHeaders.Headers); err != nil {
+				return dropTransaction(stream, err)
 			}
+
 			resp = &extproc.ProcessingResponse{
 				Response: &extproc.ProcessingResponse_ResponseHeaders{
 					ResponseHeaders: &extproc.HeadersResponse{},
@@ -133,10 +138,11 @@ func (s *serverExtProc) Process(stream extproc.ExternalProcessor_ProcessServer) 
 			if transactionID == "" {
 				return dropUnknownTransaction(stream)
 			}
-			if rb := req.GetResponseBody(); rb != nil {
-				out := fmt.Sprintf("%s RESPONSE_BODY (end_of_stream=%v, body_len=%d, body=%s)\n", ts, rb.EndOfStream, len(rb.GetBody()), string(rb.Body))
-				log.Print(out)
+
+			if err := tx.processResponseBody(v.ResponseBody); err != nil {
+				return dropResponseBodyTransaction(stream, err)
 			}
+
 			resp = &extproc.ProcessingResponse{
 				Response: &extproc.ProcessingResponse_ResponseBody{
 					ResponseBody: &extproc.BodyResponse{},
@@ -178,9 +184,10 @@ func (s *serverExtProc) newTransaction(req *extproc.ProcessingRequest_RequestHea
 
 	tx := s.waf.NewTransactionWithID(transactionID)
 	return &requestTransaction{
-		tx:          tx,
-		id:          transactionID,
-		requestBody: bytes.Buffer{},
+		tx:           tx,
+		id:           transactionID,
+		requestBody:  bytes.Buffer{},
+		responseBody: bytes.Buffer{},
 	}, nil
 }
 
@@ -214,7 +221,7 @@ func (r *requestTransaction) processRequestHeaders(attrs map[string]*structpb.St
 	}
 
 	r.tx.SetServerName(host)
-	r.setHeaders(headers)
+	setHeaders(headers, r.tx.AddRequestHeader)
 
 	if it := r.tx.ProcessRequestHeaders(); it != nil {
 		return fmt.Errorf("request denied by WAF rule %d", it.RuleID)
@@ -222,6 +229,9 @@ func (r *requestTransaction) processRequestHeaders(attrs map[string]*structpb.St
 
 	return nil
 }
+
+// TODO: This is ugly. processRequest and processResponse are identical, we can simplify
+// this logic
 
 // processRequestBody will take the body of a request and check against Coraza rules.
 // It will return an error in case any issue is found
@@ -251,6 +261,55 @@ func (r *requestTransaction) processRequestBody(body *extproc.HttpBody) error {
 	return nil
 }
 
+// processRequestHeaders is the initial step for the WAF. It receives the initial
+// request, extract the headers and the transaction ID, and returns a new
+// transaction, the transaction ID and an error if something happens on this state
+func (r *requestTransaction) processResponsetHeaders(attrs map[string]*structpb.Struct, headers *corev3.HeaderMap) error {
+	responseCode, err := strconv.Atoi(getHeaderValue(headers, ":status"))
+	if err != nil {
+		return fmt.Errorf("error decoding return code: %w", err)
+	}
+	// Note: It is not clear if when processing ResponseHeaders coraza cares about the
+	// response of upstream, or if the requested protocol vs negotiated protocol are different.
+	// this may need to be clarified
+	httpVersion := getAttribute(attrs, "request.protocol")
+	setHeaders(headers, r.tx.AddResponseHeader)
+
+	if it := r.tx.ProcessResponseHeaders(responseCode, httpVersion); it != nil {
+		return fmt.Errorf("request denied by WAF rule %d", it.RuleID)
+	}
+
+	return nil
+}
+
+// processRequesprocessResponseBodytBody will take the body of a response and check against Coraza rules.
+// It will return an error in case any issue is found
+func (r *requestTransaction) processResponseBody(body *extproc.HttpBody) error {
+	_, err := r.responseBody.Write(body.Body)
+	if err != nil {
+		return fmt.Errorf("error accumulating response body: %w", err)
+	}
+	// End Of Stream, we can process
+	if body.EndOfStream {
+		it, _, err := r.tx.WriteResponseBody(r.responseBody.Bytes())
+		if err != nil {
+			return fmt.Errorf("error parsing the response body: %w", err)
+		}
+		if it != nil {
+			return fmt.Errorf("request denied by WAF rule and action: %d - %s", it.RuleID, it.Action)
+		}
+
+		it, err = r.tx.ProcessResponseBody()
+		if err != nil {
+			return fmt.Errorf("error processing the response body: %w", err)
+		}
+		if it != nil {
+			return fmt.Errorf("request denied by WAF rule and action: %d - %s", it.RuleID, it.Action)
+		}
+	}
+	return nil
+}
+
 func dropUnknownTransaction(stream extproc.ExternalProcessor_ProcessServer) error {
 	return dropTransaction(stream, errors.New("unknown transaction"))
 }
@@ -260,7 +319,12 @@ func dropTransaction(stream extproc.ExternalProcessor_ProcessServer, err error) 
 		Response: &extproc.ProcessingResponse_ImmediateResponse{
 			ImmediateResponse: &extproc.ImmediateResponse{
 				Status: &envoy_type.HttpStatus{Code: envoy_type.StatusCode_Forbidden},
-				Body:   []byte(err.Error()),
+				Body:   []byte(fmt.Sprintf("403 Forbidden: Blocked by WAF - %s", err.Error())),
+				Headers: &extproc.HeaderMutation{
+					SetHeaders: []*corev3.HeaderValueOption{
+						{Header: &corev3.HeaderValue{Key: "content-type", Value: "text/plain"}},
+					},
+				},
 			},
 		},
 	}
@@ -268,14 +332,42 @@ func dropTransaction(stream extproc.ExternalProcessor_ProcessServer, err error) 
 	return nil
 }
 
-func (r *requestTransaction) setHeaders(headers *corev3.HeaderMap) {
+func dropResponseBodyTransaction(stream extproc.ExternalProcessor_ProcessServer, err error) error {
+	resp := &extproc.ProcessingResponse{}
+	resp.Response = &extproc.ProcessingResponse_ResponseBody{
+		ResponseBody: &extproc.BodyResponse{
+			Response: &extproc.CommonResponse{
+				// 1. Scrub the data so it doesn't leak
+				BodyMutation: &extproc.BodyMutation{
+					Mutation: &extproc.BodyMutation_ClearBody{
+						ClearBody: true,
+					},
+				},
+				// 2. Kill the connection immediately after this chunk
+				HeaderMutation: &extproc.HeaderMutation{
+					SetHeaders: []*corev3.HeaderValueOption{
+						// This tells Envoy/Browser to terminate the TCP connection
+						{Header: &corev3.HeaderValue{Key: "connection", Value: "close"}},
+					},
+				},
+			},
+		},
+	}
+	stream.Send(resp)
+	return nil
+}
+
+func setHeaders(headers *corev3.HeaderMap, addHeaderFunc func(key string, value string)) {
+	if addHeaderFunc == nil {
+		return
+	}
 	for _, h := range headers.Headers {
 		if !strings.HasPrefix(h.Key, ":") {
 			value := h.Value
 			if value == "" {
 				value = string(h.RawValue)
 			}
-			r.tx.AddRequestHeader(h.Key, value)
+			addHeaderFunc(h.Key, value)
 		}
 	}
 }
@@ -297,7 +389,6 @@ func getAttribute(attrs map[string]*structpb.Struct, key string) string {
 	}
 
 	return ""
-
 }
 
 func getHeaderValue(headers *corev3.HeaderMap, key string) string {
@@ -311,7 +402,6 @@ func getHeaderValue(headers *corev3.HeaderMap, key string) string {
 				return h.Value
 			}
 
-			// 2. If empty, convert the RawValue bytes to string
 			if len(h.RawValue) > 0 {
 				return string(h.RawValue)
 			}
